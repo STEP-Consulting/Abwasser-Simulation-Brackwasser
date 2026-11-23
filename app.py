@@ -1,128 +1,191 @@
-        if ergebnis["warnungen"]:
-            with st.expander(f"{name}: {len(ergebnis['warnungen'])} Warnung(en)"):
-                for w in ergebnis["warnungen"]:
-                    st.warning(w)
-        else:
-            st.caption(f"{name}: keine Warnungen")
+        3. Die Ergebnisse werden automatisch neu berechnet.
+        4. Im Variantenvergleich werden alle vier Anlagenkonzepte mit denselben
+           Rohwasser- und Betriebsparametern gegenübergestellt.
+        5. In der Parameterstudie lässt sich der Einfluss eines einzelnen
+           Parameters auf ausgewählte Ergebnisgrößen untersuchen.
 
-    vgl_csv = df_vgl.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
-    st.download_button(
-        "Variantenvergleich als CSV herunterladen",
-        data=vgl_csv,
-        file_name="brackwasser_variantenvergleich.csv",
-        mime="text/csv",
-        key="download_vgl",
+        **Abgebildete Anlagenvarianten**
+        - UO (Bestand)
+        - UO + NF
+        - UO + FCDI
+        - UO + NF + FCDI
+
+        Die Rückhalte-, Druck- und Energiemodelle sind Regressionsmodelle.
+        Die vom Rechenkern ausgegebenen Gültigkeitsbereichs- und
+        Extrapolationswarnungen werden deshalb in der App angezeigt.
+        """
     )
 
 
-with tab_studie:
-    st.markdown("#### Einfluss eines Parameters untersuchen")
-    st.caption(
-        "Die Parameterstudie variiert jeweils einen Parameter und berechnet "
-        "die gewählte Anlagenvariante erneut."
+# ============================================================
+# 3. SIDEBAR: EINGABEPARAMETER
+# ============================================================
+
+p_default = sim.standard_parameter()
+
+with st.sidebar:
+    st.header("Simulationseingaben")
+
+    if st.button("Standardwerte wiederherstellen", use_container_width=True):
+        for key in list(st.session_state.keys()):
+            if key.startswith("bw_"):
+                del st.session_state[key]
+        st.rerun()
+
+    st.subheader("Anlagenkonzept")
+    variante = st.selectbox(
+        "Zu berechnende Variante",
+        list(sim.VARIANTEN.keys()),
+        index=list(sim.VARIANTEN.keys()).index(p_default["variante"]),
+        key="bw_variante",
     )
 
-    parameter_optionen = {
-        "UO-Ausbeute (%)": ("y_uo", 30.0, 90.0, 5.0),
-        "NF-Ausbeute (%)": ("y_nf", 20.0, 80.0, 5.0),
-        "NF-Zulaufdruck (bar)": ("p_nf", 5.0, 30.0, 2.5),
-        "FCDI-Ausbeute (%)": ("y_fcdi", 50.0, 90.0, 5.0),
-        "Rohwasser-TDS (mg/L)": ("tds_feed", 500.0, 15000.0, 500.0),
-        "Rohwasser-Volumenstrom (m³/h)": ("v_feed", 1.0, 100.0, 5.0),
-    }
-
-    auswahl = st.selectbox("Zu variierender Parameter", list(parameter_optionen.keys()))
-    key, minimum, maximum, schritt = parameter_optionen[auswahl]
-
-    aktueller_wert = float(p_einzel[key])
-    start_wert = st.number_input(
-        "Startwert", min_value=float(minimum), max_value=float(maximum),
-        value=float(max(minimum, min(maximum, aktueller_wert - 2 * schritt))),
-        step=float(schritt), key="bw_studie_start",
+    st.subheader("Rohwasser")
+    v_feed = st.number_input(
+        "Rohwasser-Volumenstrom",
+        min_value=0.1, max_value=10000.0,
+        value=float(p_default["v_feed"]), step=0.5,
+        format="%.2f", key="bw_v_feed",
+        help="Volumenstrom des Rohwassers in m³/h.",
     )
-    ende_wert = st.number_input(
-        "Endwert", min_value=float(minimum), max_value=float(maximum),
-        value=float(max(minimum, min(maximum, aktueller_wert + 2 * schritt))),
-        step=float(schritt), key="bw_studie_ende",
+    tds_feed = st.number_input(
+        "TDS im Rohwasser",
+        min_value=1.0, max_value=100000.0,
+        value=float(p_default["tds_feed"]), step=100.0,
+        format="%.1f", key="bw_tds_feed",
+        help="Gesamter gelöster Feststoffgehalt in mg/L.",
     )
-    anzahl = st.slider("Anzahl Berechnungspunkte", 3, 25, 9, 1)
+    so4_feed = st.number_input(
+        "Sulfat im Rohwasser",
+        min_value=0.0, max_value=100000.0,
+        value=float(p_default["so4_feed"]), step=25.0,
+        format="%.1f", key="bw_so4_feed",
+    )
 
-    if start_wert >= ende_wert:
-        st.warning("Der Endwert muss größer als der Startwert sein.")
-    else:
-        werte = np.linspace(start_wert, ende_wert, anzahl)
-        studie = sim.parameterstudie(
-            p_einzel,
-            key,
-            werte,
+    with st.expander("UO – Umkehrosmose", expanded=True):
+        y_uo = st.slider(
+            "UO-Ausbeute (%)", 1.0, 99.0,
+            float(p_default["y_uo"]), 1.0, key="bw_y_uo",
         )
 
-        if not studie.empty:
-            y_auswahl = st.selectbox(
-                "Darzustellende Ergebnisgröße",
-                [
-                    "ausbeute",
-                    "tds_produkt",
-                    "e_gesamt",
-                    "v_sole",
-                    "tds_sole",
-                    "v_produkt",
-                ],
-                format_func=lambda x: {
-                    "ausbeute": "Gesamtausbeute (%)",
-                    "tds_produkt": "Produktwasser-TDS (mg/L)",
-                    "e_gesamt": "Spezifische Energie (kWh/m³)",
-                    "v_sole": "Sole-Volumenstrom (m³/h)",
-                    "tds_sole": "Sole-TDS (mg/L)",
-                    "v_produkt": "Produktwasser-Volumenstrom (m³/h)",
-                }[x],
-            )
-            x_col = key
-            if y_auswahl in studie.columns:
-                plot_df = studie.dropna(subset=[y_auswahl]).copy()
-                if not plot_df.empty:
-                    fig = px.line(
-                        plot_df, x=x_col, y=y_auswahl,
-                        markers=True,
-                        title=f"{auswahl} – Einfluss auf {y_auswahl}",
-                    )
-                    fig.update_layout(
-                        template="plotly_white",
-                        xaxis_title=auswahl,
-                        yaxis_title=y_auswahl,
-                        height=420,
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.warning(
-                        "Für diese Parameterkombination konnten keine "
-                        "gültigen Werte berechnet werden."
-                    )
+    with st.expander("NF – Nanofiltration", expanded=True):
+        y_nf = st.slider(
+            "NF-Ausbeute (%)", 1.0, 99.0,
+            float(p_default["y_nf"]), 1.0, key="bw_y_nf",
+        )
+        p_nf = st.number_input(
+            "NF-Zulaufdruck (bar)",
+            min_value=0.0, max_value=100.0,
+            value=float(p_default["p_nf"]), step=0.5,
+            key="bw_p_nf",
+        )
+        nf_modul = st.selectbox(
+            "NF-Modul / Regression",
+            ["A", "B"],
+            index=0 if p_default["nf_modul"] == "A" else 1,
+            key="bw_nf_modul",
+        )
+        nf_energie_basis = st.selectbox(
+            "Bezugsbasis NF-Energie",
+            ["zulauf", "permeat"],
+            index=["zulauf", "permeat"].index(p_default["nf_energie_basis"]),
+            format_func=lambda x: "NF-Zulauf" if x == "zulauf" else "NF-Permeat",
+            key="bw_nf_energie_basis",
+        )
 
-            studie_anzeige = studie.copy()
-            for col in studie_anzeige.columns:
-                if col != key and col != "warnungen":
-                    studie_anzeige[col] = studie_anzeige[col].map(
-                        lambda x: fmt_de(x, 3) if pd.notna(x) else "–"
-                    )
-            st.dataframe(studie_anzeige, use_container_width=True, hide_index=True)
+    with st.expander("FCDI – kapazitive Deionisation", expanded=True):
+        y_fcdi = st.slider(
+            "FCDI-Ausbeute (%)", 1.0, 99.0,
+            float(p_default["y_fcdi"]), 1.0, key="bw_y_fcdi",
+        )
 
-            studie_csv = studie.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
-            st.download_button(
-                "Parameterstudie als CSV herunterladen",
-                data=studie_csv,
-                file_name="brackwasser_parameterstudie.csv",
-                mime="text/csv",
-                key="download_studie",
-            )
+    with st.expander("Energie, Bilanzierung und Modell", expanded=False):
+        eta_pumpe = st.slider(
+            "Pumpenwirkungsgrad (%)", 10, 100,
+            int(round(p_default["eta_pumpe"] * 100)), 1,
+            key="bw_eta_pumpe",
+        ) / 100.0
+        strompreis = st.number_input(
+            "Strompreis (€/kWh)",
+            min_value=0.0, max_value=10.0,
+            value=float(p_default["strompreis"]), step=0.01,
+            format="%.3f", key="bw_strompreis",
+        )
+        bilanz_modus = st.selectbox(
+            "Bilanzierungsmodus",
+            ["korrekt", "excel"],
+            format_func=lambda x: (
+                "Physikalisch konsistent" if x == "korrekt"
+                else "Excel-Nachrechnung"
+            ),
+            key="bw_bilanz_modus",
+        )
+        range_modus = st.selectbox(
+            "Umgang mit Modellgrenzen",
+            ["extrapolieren", "streng"],
+            format_func=lambda x: (
+                "Außerhalb extrapolieren (mit Warnung)" if x == "extrapolieren"
+                else "Streng – außerhalb nicht berechnen"
+            ),
+            key="bw_range_modus",
+        )
 
 
-# ============================================================
-# 8. FOOTER
-# ============================================================
-
-st.divider()
-st.caption(
-    "Brackwasser-Aufbereitungssimulation | Ergebnisse basieren auf den im "
-    "Rechenkern hinterlegten Regressionsmodellen und Betriebsannahmen."
+# Parameterdictionary des Rechenkerns aufbauen
+p_basis = dict(p_default)
+p_basis.update(
+    {
+        "v_feed": float(v_feed),
+        "tds_feed": float(tds_feed),
+        "so4_feed": float(so4_feed),
+        "y_uo": float(y_uo),
+        "y_nf": float(y_nf),
+        "p_nf": float(p_nf),
+        "y_fcdi": float(y_fcdi),
+        "eta_pumpe": float(eta_pumpe),
+        "nf_modul": nf_modul,
+        "nf_energie_basis": nf_energie_basis,
+        "strompreis": float(strompreis),
+        "bilanz_modus": bilanz_modus,
+        "range_modus": range_modus,
+    }
 )
+
+p_einzel = sim.mit_variante(p_basis, variante)
+
+
+# ============================================================
+# 4. BERECHNUNG
+# ============================================================
+
+try:
+    with st.spinner("Simulation wird berechnet …"):
+        res = sim.simuliere(p_einzel)
+        vergleich = sim.vergleich(p_basis)
+except Exception as exc:
+    st.error(f"Die Simulation konnte nicht berechnet werden: {exc}")
+    st.exception(exc)
+    st.stop()
+
+kenn = res["kenn"]
+df = res["df"]
+
+
+# ============================================================
+# 5. PROZESSFLIESSBILD
+# ============================================================
+
+st.subheader(f"Prozessfließbild – {variante}")
+
+if dar is not None and hasattr(dar, "build_svg"):
+    try:
+        svg = dar.build_svg(res)
+        components.html(svg, height=470, scrolling=True)
+    except Exception as exc:
+        st.warning(f"Das Prozessfließbild konnte nicht erzeugt werden: {exc}")
+else:
+    st.info(
+        "Für das dynamische Prozessfließbild bitte die Datei "
+        "`darstellung.py` mit der Funktion `build_svg(res)` neben `app.py` ablegen."
+    )
+
