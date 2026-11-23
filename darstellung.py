@@ -4,13 +4,20 @@ import math
 from html import escape
 
 
-def fmt_de(x, nd=1):
-    if x is None or (isinstance(x, float) and math.isnan(x)): return "–"
-    s = f"{x:,.{nd}f}"
-    return s.replace(",", "X").replace(".", ",").replace("X", ".")
-
-
 from html import escape
+import numpy as np
+
+
+def fmt_de(value, stellen=1):
+    """Deutsches Zahlenformat."""
+    if value is None:
+        return "–"
+    try:
+        if not np.isfinite(float(value)):
+            return "–"
+    except (TypeError, ValueError):
+        return "–"
+    return f"{float(value):,.{stellen}f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
 def build_svg(res):
