@@ -1,346 +1,608 @@
 # -*- coding: utf-8 -*-
 """
-Rechenkern: Brackwasser-Aufbereitung (UO, UO + NF, UO + FCDI, UO + NF + FCDI)
+Streamlit-App: Brackwasser-Aufbereitung
+Benötigte Dateien im selben Ordner:
+    app.py
+    simulation.py
+    darstellung.py
 
-Abgeleitet aus der Excel-Simulation „E190_TP05_16-2 Simulierung Konzept 4 – Brackwasser“.
-Prozess:  Rohwasser -> UO (Umkehrosmose) -> Permeat = Produkt
-          UO-Konzentrat -> [NF] -> NF-Permeat zurück in den UO-Zulauf (Rezirkulation)
-          UO- bzw. NF-Konzentrat -> [FCDI] -> Diluat = Produkt, Konzentrat = Sole
-
-Die Rückhalte, Drücke und spezifischen Energien der Verfahren sind Surrogatmodelle
-(lineare bzw. quadratische Regressionen) aus Simulations- und Versuchsdaten (siehe DATEN).
-Rezirkulationen werden iterativ gelöst (statt Excel-Solver).
-
-Zwei Betriebsmodi zur Nachrechnung der Excel-Datei:
-  bilanz_modus="excel"   : UO-Konzentrat-Salzbilanz wie im Excel (NF-Permeat statt UO-Permeat abgezogen)
-  nf_energie_basis="permeat": NF-Energie je m³ Permeat wie im Excel (statt je m³ NF-Zulauf)
-Standard ist jeweils die physikalisch konsistente Variante ("korrekt" bzw. "zulauf").
+Start:
+    streamlit run app.py
 """
 
-import copy
 import math
+import io
 
 import numpy as np
 import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+import streamlit.components.v1 as components
 
-# =========================================================
-# 1. DATEN UND KOEFFIZIENTEN
-# =========================================================
+import simulation as sim
 
-# Rohdaten der Regressionen (Quelle: Excel, Blätter „Auswertung UO/NF/FCDI“, „Labordaten …“)
-DATEN = {
-    "uo_niedrig": {  # TDS-Feed 1.000 mg/L, UO-Simulation (WAVE)
-        "ausbeute": [55, 65, 75, 85], "rej_tds": [99.154, 98.603, 98.052, 97.502], "rej_so4": [99.9, 99.9, 99.85, 99.8],
-        "p_feed": [6.82, 8.27, 9.71, 11.16], "p_konz": [3.78, 5.74, 7.70, 9.65], "e_spec": [0.47, 0.44, 0.41, 0.39]},
-    "uo_hoch": {  # TDS-Feed 10.000 mg/L
-        "ausbeute": [55, 65, 75], "rej_tds": [99.0435, 98.9884, 98.9333], "rej_so4": [99.9, 99.875, 99.8],
-        "p_feed": [21.52, 22.96, 24.41], "p_konz": [18.39, 20.34, 22.30], "e_spec": [1.31, 1.28, 1.25]},
-    "nf_A": {"tds_feed": [3610, 7670, 18700], "rej_tds": [56.5097, 43.15515, 47.96791], "rej_so4": [85.0, 80.90909, 80.71429]},
-    "nf_B": {"tds_feed": [3610, 7679, 18700], "rej_tds": [85.62327, 86.57106, 80.42781], "rej_so4": [98.33333, 99.35455, 97.28571]},
-    "fcdi_niedrig": {"tds_feed": [5628.4, 9244.0, 9224.46667], "ausbeute": [50.0, 66.66667, 83.33333],
-                     "rej_tds": [97.48216, 98.13139, 97.91884], "rej_so4": [92.12598, 98.14328, 97.89907], "e_spec": [3.029, 3.50296, 3.42245]},
-    "fcdi_hoch": {"tds_feed": [35780.5, 37376.33333, 37524.0], "ausbeute": [50.0, 66.66667, 83.33333],
-                  "rej_tds": [81.5352, 64.80671, 78.0419], "rej_so4": [81.22944, 65.63674, 78.05594], "e_spec": [17.63, 15.3363, 15.37806]},
-}
-
-# Koeffizienten wie in der Excel-Datei hinterlegt (Ausbeute in %, bei FCDI als Anteil 0..1)
-UO_KOEFF = {
-    "niedrig": dict(rej_tds=(-0.055, 102.175), rej_so4=(-0.0035, 100.1075), p_feed=(0.1446, -1.132), p_konz=(0.1957, -6.9815), e_spec=(-0.0027, 0.6165)),
-    "hoch": dict(rej_tds=(-0.0055, 99.3442), rej_so4=(-0.005, 100.185), p_feed=(0.1445, 13.5708), p_konz=(0.1955, 7.6358), e_spec=(-0.003, 1.475)),
-}
-FCDI_KOEFF = {  # y = a*TDS_in + b*Ausbeute(Anteil) + c
-    "niedrig": dict(rej_tds=(0.00024, -1.283192, 96.770159), e_spec=(0.000153, -0.48137, 2.411647), rej_so4=(0.001719, -0.01239, 83.0722)),
-    "hoch": dict(rej_tds=(-0.021396, 102.43436, 795.870347), e_spec=(-0.001621, 1.746077, 74.756989), rej_so4=(-0.019348, 0.916995, 727.665571)),
-}
-NF_KOEFF_B = dict(rej_tds=(-5.2392e-08, 0.00082492, 83.3248), rej_so4=(-2.8999e-08, 0.00057804, 96.6212))
-
-# Gültigkeitsbereiche (aus den Excel-Formeln)
-UO_REJ_GRENZE = 5000.0             # < 5.000 mg/L: Regression 1.000 mg/L, sonst 10.000 mg/L
-UO_PE_NIEDRIG_MAX = 2000.0         # Druck/Energie nur < 2.000 mg/L ...
-UO_PE_HOCH = (9000.0, 11000.0)     # ... oder 9.000 bis 11.000 mg/L
-NF_BEREICH = (2000.0, 20000.0)     # „Simulationsgrenzen“ NF-TDS-Feed
-NF_DATENBEREICH = (3610.0, 18700.0)
-FCDI_BEREICH_NIEDRIG = (3000.0, 13000.0)
-FCDI_BEREICH_NIEDRIG_TDS_E = (2000.0, 13000.0)   # Blatt 4b: Rückhalt TDS und Energie ab 2.000 mg/L
-FCDI_BEREICH_HOCH = (35000.0, 38000.0)
-FCDI_AUSBEUTE_DATEN = (50.0, 83.4)
-ANTISCALANT_MG_L = 3.0
-HCL_MG_L = {"niedrig": 68.9, "hoch": 50.7}
-
-VARIANTEN = {
-    "UO (Bestand)": dict(nf=False, fcdi=False),
-    "UO + NF": dict(nf=True, fcdi=False),
-    "UO + FCDI": dict(nf=False, fcdi=True),
-    "UO + NF + FCDI": dict(nf=True, fcdi=True),
-}
+try:
+    import darstellung as dar
+except ImportError:
+    dar = None
 
 
-def fit_linear(x, y):
-    a, b = np.polyfit(np.asarray(x, float), np.asarray(y, float), 1)
-    return float(a), float(b)
+# ============================================================
+# 1. SEITENKONFIGURATION UND DESIGN
+# ============================================================
+
+st.set_page_config(
+    page_title="Brackwasser-Aufbereitung | Simulation",
+    page_icon="💧",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 1.5rem; padding-bottom: 2rem;}
+    [data-testid="stMetric"] {
+        background: #f7f9fb;
+        border: 1px solid #e6ebf0;
+        padding: 13px 15px;
+        border-radius: 10px;
+    }
+    div[data-testid="stExpander"] {
+        border: 1px solid #e6ebf0;
+        border-radius: 10px;
+    }
+    .small-muted {color: #667085; font-size: 0.88rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
-def fit_quadratisch(x, y):
-    c = np.polyfit(np.asarray(x, float), np.asarray(y, float), 2)
-    return tuple(float(v) for v in c)
+def fmt_de(value, stellen=1):
+    """Deutsches Zahlenformat."""
+    if value is None:
+        return "–"
+    try:
+        if not np.isfinite(float(value)):
+            return "–"
+    except (TypeError, ValueError):
+        return "–"
+    return f"{float(value):,.{stellen}f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def fit_ebene(tds, ausbeute_pct, y):
-    """y = a*TDS + b*Ausbeute(Anteil) + c (exakt durch 3 Punkte)."""
-    A = np.column_stack([np.asarray(tds, float), np.asarray(ausbeute_pct, float) / 100.0, np.ones(len(tds))])
-    sol = np.linalg.lstsq(A, np.asarray(y, float), rcond=None)[0]
-    return tuple(float(v) for v in sol)
+def metric_safe(container, label, value, unit="", help_text=None):
+    text = f"{value} {unit}".strip()
+    container.metric(label, text, help=help_text)
 
 
-def nf_koeff(modul):
-    if modul == "B": return NF_KOEFF_B
-    d = DATEN["nf_A"]
-    return dict(rej_tds=fit_quadratisch(d["tds_feed"], d["rej_tds"]), rej_so4=fit_quadratisch(d["tds_feed"], d["rej_so4"]))
+# ============================================================
+# 2. KOPFBEREICH
+# ============================================================
 
+st.title("Brackwasser-Aufbereitung")
+st.caption(
+    "Verfahrenssimulation für Umkehrosmose (UO), Nanofiltration (NF) "
+    "und kapazitive Deionisation (FCDI)"
+)
 
-# =========================================================
-# 2. SURROGATMODELLE
-# =========================================================
+with st.expander("Bedienung und Modellübersicht", expanded=False):
+    st.markdown(
+        """
+        **So verwendest du die Simulation**
 
-def _clip_rej(x):
-    return float(min(max(x, 0.0), 99.99))
+        1. Stelle links die Rohwasser- und Verfahrensparameter ein.
+        2. Wähle die Anlagenvariante und den Bilanzierungsmodus.
+        3. Die Ergebnisse werden automatisch neu berechnet.
+        4. Im Variantenvergleich werden alle vier Anlagenkonzepte mit denselben
+           Rohwasser- und Betriebsparametern gegenübergestellt.
+        5. In der Parameterstudie lässt sich der Einfluss eines einzelnen
+           Parameters auf ausgewählte Ergebnisgrößen untersuchen.
 
+        **Abgebildete Anlagenvarianten**
+        - UO (Bestand)
+        - UO + NF
+        - UO + FCDI
+        - UO + NF + FCDI
 
-def uo_eigenschaften(tds, ausbeute_pct, range_modus="extrapolieren"):
-    """Rückhalte (%), Drücke (bar) und spez. Energie (kWh/m³ Permeat) der UO."""
-    warn = []
-    serie_rej = "niedrig" if tds < UO_REJ_GRENZE else "hoch"
-    r = UO_KOEFF[serie_rej]
-    out = dict(rej_tds=_clip_rej(r["rej_tds"][0] * ausbeute_pct + r["rej_tds"][1]),
-               rej_so4=_clip_rej(r["rej_so4"][0] * ausbeute_pct + r["rej_so4"][1]), serie_rej=serie_rej)
-    # Druck / Energie: Excel erlaubt nur 2 Bereiche
-    if tds < UO_PE_NIEDRIG_MAX: serie = "niedrig"
-    elif UO_PE_HOCH[0] <= tds <= UO_PE_HOCH[1]: serie = "hoch"
-    else: serie = None
-    if serie is None:
-        if range_modus == "streng":
-            out.update(p_feed=math.nan, p_konz=math.nan, e_spec=math.nan, serie_pe=None)
-            warn.append(f"UO: Zulauf-TDS {tds:,.0f} mg/L außerhalb der Simulationsgrenzen für Druck/Energie (<2.000 oder 9.000–11.000 mg/L).")
-            return out | dict(warnungen=warn)
-        serie = "niedrig" if tds < UO_REJ_GRENZE else "hoch"
-        warn.append(f"UO: Zulauf-TDS {tds:,.0f} mg/L außerhalb der Datenbereiche für Druck/Energie; Regression '{serie}' extrapoliert.")
-    k = UO_KOEFF[serie]
-    out.update(p_feed=k["p_feed"][0] * ausbeute_pct + k["p_feed"][1], p_konz=k["p_konz"][0] * ausbeute_pct + k["p_konz"][1],
-               e_spec=k["e_spec"][0] * ausbeute_pct + k["e_spec"][1], serie_pe=serie)
-    d = DATEN["uo_" + serie]
-    if not (min(d["ausbeute"]) <= ausbeute_pct <= max(d["ausbeute"])):
-        warn.append(f"UO: Ausbeute {ausbeute_pct:.0f} % außerhalb des Datenbereichs {min(d['ausbeute'])}–{max(d['ausbeute'])} % (Regression '{serie}').")
-    if tds < 1000 * 0.5:
-        warn.append(f"UO: Zulauf-TDS {tds:,.0f} mg/L deutlich unter dem Datenbereich (1.000 mg/L).")
-    return out | dict(warnungen=warn)
-
-
-def nf_eigenschaften(tds, modul="B"):
-    """TDS- und Sulfat-Rückhalt (%) der NF in Abhängigkeit vom NF-Zulauf-TDS (quadratische Regression)."""
-    k = nf_koeff(modul); warn = []
-    rt = k["rej_tds"][0] * tds ** 2 + k["rej_tds"][1] * tds + k["rej_tds"][2]
-    rs = k["rej_so4"][0] * tds ** 2 + k["rej_so4"][1] * tds + k["rej_so4"][2]
-    if not (NF_BEREICH[0] <= tds <= NF_BEREICH[1]):
-        warn.append(f"NF: Zulauf-TDS {tds:,.0f} mg/L außerhalb der Simulationsgrenzen {NF_BEREICH[0]:,.0f}–{NF_BEREICH[1]:,.0f} mg/L.".replace(",", "."))
-    elif not (NF_DATENBEREICH[0] <= tds <= NF_DATENBEREICH[1]):
-        warn.append(f"NF: Zulauf-TDS {tds:,.0f} mg/L liegt außerhalb der Messpunkte ({NF_DATENBEREICH[0]:,.0f}–{NF_DATENBEREICH[1]:,.0f} mg/L), Regression wird extrapoliert.".replace(",", "."))
-    return dict(rej_tds=_clip_rej(rt), rej_so4=_clip_rej(rs), warnungen=warn)
-
-
-def fcdi_eigenschaften(tds, ausbeute_pct, range_modus="extrapolieren", excel=False):
-    """TDS-/Sulfat-Rückhalt (%) und spez. Energie (kWh/m³ Diluat) der FCDI.
-
-    excel=True: Sulfat-Ausbeutekoeffizient wie im Excel verwendet (dort in %-Einheiten, aber mit Ausbeute als Anteil multipliziert,
-    dadurch 100-fach zu klein). excel=False: Koeffizient wird korrekt auf Ausbeute als Anteil umgerechnet (x100)."""
-    warn = []; y = ausbeute_pct / 100.0
-    def ebene(k, so4=False): return k[0] * tds + k[1] * (100.0 if (so4 and not excel) else 1.0) * y + k[2]
-    lo_t, hi_t = FCDI_BEREICH_NIEDRIG_TDS_E; lo_s, hi_s = FCDI_BEREICH_NIEDRIG
-    in_hoch = FCDI_BEREICH_HOCH[0] <= tds <= FCDI_BEREICH_HOCH[1]
-    res = {}
-    for key, rng in (("rej_tds", (lo_t, hi_t)), ("e_spec", (lo_t, hi_t)), ("rej_so4", (lo_s, hi_s))):
-        if rng[0] <= tds <= rng[1]: serie = "niedrig"
-        elif in_hoch: serie = "hoch"
-        else:
-            if range_modus == "streng": res[key] = math.nan; continue
-            serie = "niedrig" if tds < 24000 else "hoch"
-        v = ebene(FCDI_KOEFF[serie][key], so4=(key == "rej_so4")); res[key] = v if key == "e_spec" else _clip_rej(v)
-    if any(math.isnan(v) for v in res.values()):
-        warn.append(f"FCDI: Zulauf-TDS {tds:,.0f} mg/L außerhalb der Simulationsgrenzen ({lo_s:,.0f}–{hi_s:,.0f} bzw. 35.000–38.000 mg/L); betroffene Werte nicht berechenbar.".replace(",", "."))
-    elif not (lo_s <= tds <= hi_s or in_hoch):
-        warn.append(f"FCDI: Zulauf-TDS {tds:,.0f} mg/L außerhalb der Simulationsgrenzen; Regression extrapoliert.".replace(",", "."))
-    elif tds < lo_s:
-        warn.append(f"FCDI: Zulauf-TDS {tds:,.0f} mg/L unter 3.000 mg/L: Sulfat-Rückhalt außerhalb der Messpunkte.".replace(",", "."))
-    if not (FCDI_AUSBEUTE_DATEN[0] <= ausbeute_pct <= FCDI_AUSBEUTE_DATEN[1]):
-        warn.append(f"FCDI: Ausbeute {ausbeute_pct:.0f} % außerhalb des Datenbereichs 50–83 % (Excel erlaubt 50–90 %).")
-    if in_hoch:
-        warn.append("FCDI: Regression für 35.000–38.000 mg/L beruht auf 3 Punkten mit teils unplausiblen Rückhalten; nur mit Vorsicht verwenden.")
-    return res | dict(warnungen=warn)
-
-
-# =========================================================
-# 3. PARAMETER UND SIMULATION
-# =========================================================
-
-def standard_parameter():
-    return dict(
-        variante="UO + NF + FCDI", nf=True, fcdi=True,
-        v_feed=10.0, tds_feed=1000.0, so4_feed=200.0,
-        y_uo=55.0, y_nf=50.0, p_nf=12.0, y_fcdi=50.0,
-        eta_pumpe=0.75, nf_modul="B",
-        bilanz_modus="korrekt",          # "korrekt" | "excel"
-        nf_energie_basis="zulauf",       # "zulauf" | "permeat"
-        range_modus="extrapolieren",     # "extrapolieren" | "streng"
-        strompreis=0.20,                 # €/kWh (Annahme)
+        Die Rückhalte-, Druck- und Energiemodelle sind Regressionsmodelle.
+        Die vom Rechenkern ausgegebenen Gültigkeitsbereichs- und
+        Extrapolationswarnungen werden deshalb in der App angezeigt.
+        """
     )
 
 
-def mit_variante(p, name):
-    q = copy.deepcopy(p); q["variante"] = name; q.update(VARIANTEN[name]); return q
+# ============================================================
+# 3. SIDEBAR: EINGABEPARAMETER
+# ============================================================
 
+p_default = sim.standard_parameter()
 
-def _loesen(p, warn):
-    v1, c1, s1 = p["v_feed"], p["tds_feed"], p["so4_feed"]
-    yu, yn = p["y_uo"] / 100.0, p["y_nf"] / 100.0
-    nf = bool(p["nf"])
-    v2 = v1 / (1.0 - (1.0 - yu) * yn) if nf else v1
-    v3 = yu * v2; v4 = v2 - v3
-    v5 = yn * v4 if nf else 0.0
-    v6 = v4 - v5 if nf else v4
-    c2, s2 = c1, s1; c5 = s5 = 0.0
-    it = 0
-    for it in range(1, 2001):
-        uo = uo_eigenschaften(c2, p["y_uo"], p["range_modus"])
-        c3 = c2 * (1 - uo["rej_tds"] / 100.0); s3 = s2 * (1 - uo["rej_so4"] / 100.0)
-        if nf and p["bilanz_modus"] == "excel":
-            c4 = (c2 * v2 - c5 * v5) / v4; s4 = (s2 * v2 - s5 * v5) / v4
-        else:
-            c4 = (c2 * v2 - c3 * v3) / v4; s4 = (s2 * v2 - s3 * v3) / v4
-        if nf:
-            nfp = nf_eigenschaften(c4, p["nf_modul"])
-            c5n = c4 * (1 - nfp["rej_tds"] / 100.0); s5n = s4 * (1 - nfp["rej_so4"] / 100.0)
-            c2n = (v1 * c1 + v5 * c5n) / v2; s2n = (v1 * s1 + v5 * s5n) / v2
-            dif = abs(c2n - c2) + abs(s2n - s2) + abs(c5n - c5) + abs(s5n - s5)
-            c2, s2, c5, s5 = c2n, s2n, c5n, s5n
-        else:
-            dif = 0.0
-        if dif < 1e-11: break
-    # konsistente Endwerte
-    uo = uo_eigenschaften(c2, p["y_uo"], p["range_modus"])
-    c3 = c2 * (1 - uo["rej_tds"] / 100.0); s3 = s2 * (1 - uo["rej_so4"] / 100.0)
-    if nf and p["bilanz_modus"] == "excel":
-        c4 = (c2 * v2 - c5 * v5) / v4; s4 = (s2 * v2 - s5 * v5) / v4
-    else:
-        c4 = (c2 * v2 - c3 * v3) / v4; s4 = (s2 * v2 - s3 * v3) / v4
-    nfp = None
-    if nf:
-        nfp = nf_eigenschaften(c4, p["nf_modul"])
-        c5 = c4 * (1 - nfp["rej_tds"] / 100.0); s5 = s4 * (1 - nfp["rej_so4"] / 100.0)
-        c6 = (c4 * v4 - c5 * v5) / v6; s6 = (s4 * v4 - s5 * v5) / v6
-    else:
-        c6, s6 = c4, s4
-    warn += uo["warnungen"]
-    if nfp: warn += nfp["warnungen"]
-    return dict(v2=v2, v3=v3, v4=v4, v5=v5, v6=v6, c2=c2, s2=s2, c3=c3, s3=s3, c4=c4, s4=s4, c5=c5, s5=s5, c6=c6, s6=s6,
-                uo=uo, nfp=nfp, iterationen=it, konvergenz_diff=dif)
+with st.sidebar:
+    st.header("Simulationseingaben")
 
+    if st.button("Standardwerte wiederherstellen", use_container_width=True):
+        for key in list(st.session_state.keys()):
+            if key.startswith("bw_"):
+                del st.session_state[key]
+        st.rerun()
 
-def simuliere(p):
-    """Berechnet Stoffströme, Konzentrationen, Energie und Chemikalien für eine Variante."""
-    warn = []
-    nf, fcdi = bool(p["nf"]), bool(p["fcdi"])
-    if p["y_uo"] >= 99 or p["y_uo"] <= 0: raise ValueError("UO-Ausbeute muss zwischen 0 und 99 % liegen.")
-    s = _loesen(p, warn)
-    v1, c1, s1 = p["v_feed"], p["tds_feed"], p["so4_feed"]
-    fc = None
-    if fcdi:
-        v_in, c_in, s_in = s["v6"], s["c6"], s["s6"]
-        yf = p["y_fcdi"] / 100.0
-        fc = fcdi_eigenschaften(c_in, p["y_fcdi"], p["range_modus"], excel=(p["bilanz_modus"] == "excel")); warn += fc["warnungen"]
-        vd = yf * v_in; vc = v_in - vd
-        cd = c_in * (1 - fc["rej_tds"] / 100.0) if not math.isnan(fc["rej_tds"]) else math.nan
-        sd = s_in * (1 - fc["rej_so4"] / 100.0) if not math.isnan(fc["rej_so4"]) else math.nan
-        cc = (c_in * v_in - cd * vd) / vc if not math.isnan(cd) else math.nan
-        sc_ = (s_in * v_in - sd * vd) / vc if not math.isnan(sd) else math.nan
-    else:
-        vd = vc = 0.0; cd = sd = cc = sc_ = 0.0
-    vp = s["v3"] + vd
-    cp = (s["v3"] * s["c3"] + vd * cd) / vp if not math.isnan(cd) else math.nan
-    sp = (s["v3"] * s["s3"] + vd * sd) / vp if not math.isnan(sd) else math.nan
-    if fcdi: vb, cb, sb = vc, cc, sc_
-    else: vb, cb, sb = s["v6"], s["c6"], s["s6"]
-
-    # --- Energie (kW bzw. kWh/m³ Produkt)
-    uo = s["uo"]
-    e_uo_spez_perm = uo["e_spec"]; p_uo = e_uo_spez_perm * s["v3"]
-    if nf:
-        dp = max(p["p_nf"] - uo["p_konz"], 0.0) if not math.isnan(uo["p_konz"]) else math.nan
-        basis_v = s["v4"] if p["nf_energie_basis"] == "zulauf" else s["v5"]
-        p_nf = basis_v * dp / (36.0 * p["eta_pumpe"]) if not math.isnan(dp) else math.nan
-        e_nf_spez_perm = (dp / (36.0 * p["eta_pumpe"]) if not math.isnan(dp) else math.nan)
-    else:
-        dp = 0.0; p_nf = 0.0; e_nf_spez_perm = 0.0
-    p_fc = fc["e_spec"] * vd if fcdi and not math.isnan(fc["e_spec"]) else (math.nan if fcdi else 0.0)
-    p_ges = p_uo + p_nf + p_fc
-    spez = {k: v / vp for k, v in (("UO", p_uo), ("NF", p_nf), ("FCDI", p_fc))}
-    spez["gesamt"] = p_ges / vp
-    # --- Chemikalien (je m³ Produkt, g/m³): Dosierung am UO-Zulauf
-    serie_chem = "niedrig" if s["c2"] < UO_REJ_GRENZE else "hoch"
-    chem = dict(antiscalant=ANTISCALANT_MG_L * s["v2"] / vp, hcl=HCL_MG_L[serie_chem] * s["v2"] / vp)
-
-    # --- Stromtabelle
-    zeilen = [
-        ("1 Rohwasser", v1, c1, s1), ("2 UO-Zulauf", s["v2"], s["c2"], s["s2"]), ("3 UO-Permeat", s["v3"], s["c3"], s["s3"]),
-        ("4 UO-Konzentrat", s["v4"], s["c4"], s["s4"]),
-    ]
-    if nf: zeilen += [("5 NF-Permeat (Rezirkulation)", s["v5"], s["c5"], s["s5"]), ("6 NF-Konzentrat", s["v6"], s["c6"], s["s6"])]
-    if fcdi: zeilen += [("7 FCDI-Diluat", vd, cd, sd), ("8 FCDI-Konzentrat", vc, cc, sc_)]
-    zeilen += [("P Produkt", vp, cp, sp), ("B Sole (Abfluss)", vb, cb, sb)]
-    df = pd.DataFrame(zeilen, columns=["Strom", "Volumenstrom (m³/h)", "TDS (mg/L)", "Sulfat (mg/L)"])
-    df["TDS-Fracht (g/h)"] = df["Volumenstrom (m³/h)"] * df["TDS (mg/L)"]
-
-    wasser_abw = v1 - vp - vb
-    salz_abw = (v1 * c1 - vp * cp - vb * cb) if not (math.isnan(cp) or math.isnan(cb)) else math.nan
-    kenn = dict(
-        v_produkt=vp, tds_produkt=cp, so4_produkt=sp, v_sole=vb, tds_sole=cb, so4_sole=sb,
-        ausbeute=vp / v1 * 100.0, rueckhalt_gesamt=(1 - cp / c1) * 100.0 if not math.isnan(cp) else math.nan,
-        rueckhalt_so4_gesamt=(1 - sp / s1) * 100.0 if not math.isnan(sp) else math.nan,
-        leistung_kw=p_ges, p_uo_kw=p_uo, p_nf_kw=p_nf, p_fcdi_kw=p_fc,
-        e_spez=spez, energiekosten_ct_m3=spez["gesamt"] * p["strompreis"] * 100.0,
-        chemikalien=chem, wasserbilanz_abw=wasser_abw, salzbilanz_abw=salz_abw,
-        uo=uo, nf=s["nfp"], fcdi=fc, p_nf_feed=p["p_nf"] if nf else math.nan, dp_nf_boost=dp,
-        e_nf_spez_perm=e_nf_spez_perm, iterationen=s["iterationen"], volumen_uo_zulauf=s["v2"],
-        gueltig=not any(math.isnan(x) for x in (cp, p_ges, cb)),
+    st.subheader("Anlagenkonzept")
+    variante = st.selectbox(
+        "Zu berechnende Variante",
+        list(sim.VARIANTEN.keys()),
+        index=list(sim.VARIANTEN.keys()).index(p_default["variante"]),
+        key="bw_variante",
     )
-    # Warnungen eindeutig machen
-    seen = []
-    for w in warn:
-        if w not in seen: seen.append(w)
-    return dict(df=df, kenn=kenn, warnungen=seen, s=s, parameter=copy.deepcopy(p))
+
+    st.subheader("Rohwasser")
+    v_feed = st.number_input(
+        "Rohwasser-Volumenstrom",
+        min_value=0.1, max_value=10000.0,
+        value=float(p_default["v_feed"]), step=0.5,
+        format="%.2f", key="bw_v_feed",
+        help="Volumenstrom des Rohwassers in m³/h.",
+    )
+    tds_feed = st.number_input(
+        "TDS im Rohwasser",
+        min_value=1.0, max_value=100000.0,
+        value=float(p_default["tds_feed"]), step=100.0,
+        format="%.1f", key="bw_tds_feed",
+        help="Gesamter gelöster Feststoffgehalt in mg/L.",
+    )
+    so4_feed = st.number_input(
+        "Sulfat im Rohwasser",
+        min_value=0.0, max_value=100000.0,
+        value=float(p_default["so4_feed"]), step=25.0,
+        format="%.1f", key="bw_so4_feed",
+    )
+
+    with st.expander("UO – Umkehrosmose", expanded=True):
+        y_uo = st.slider(
+            "UO-Ausbeute (%)", 1.0, 99.0,
+            float(p_default["y_uo"]), 1.0, key="bw_y_uo",
+        )
+
+    with st.expander("NF – Nanofiltration", expanded=True):
+        y_nf = st.slider(
+            "NF-Ausbeute (%)", 1.0, 99.0,
+            float(p_default["y_nf"]), 1.0, key="bw_y_nf",
+        )
+        p_nf = st.number_input(
+            "NF-Zulaufdruck (bar)",
+            min_value=0.0, max_value=100.0,
+            value=float(p_default["p_nf"]), step=0.5,
+            key="bw_p_nf",
+        )
+        nf_modul = st.selectbox(
+            "NF-Modul / Regression",
+            ["A", "B"],
+            index=0 if p_default["nf_modul"] == "A" else 1,
+            key="bw_nf_modul",
+        )
+        nf_energie_basis = st.selectbox(
+            "Bezugsbasis NF-Energie",
+            ["zulauf", "permeat"],
+            index=["zulauf", "permeat"].index(p_default["nf_energie_basis"]),
+            format_func=lambda x: "NF-Zulauf" if x == "zulauf" else "NF-Permeat",
+            key="bw_nf_energie_basis",
+        )
+
+    with st.expander("FCDI – kapazitive Deionisation", expanded=True):
+        y_fcdi = st.slider(
+            "FCDI-Ausbeute (%)", 1.0, 99.0,
+            float(p_default["y_fcdi"]), 1.0, key="bw_y_fcdi",
+        )
+
+    with st.expander("Energie, Bilanzierung und Modell", expanded=False):
+        eta_pumpe = st.slider(
+            "Pumpenwirkungsgrad (%)", 10, 100,
+            int(round(p_default["eta_pumpe"] * 100)), 1,
+            key="bw_eta_pumpe",
+        ) / 100.0
+        strompreis = st.number_input(
+            "Strompreis (€/kWh)",
+            min_value=0.0, max_value=10.0,
+            value=float(p_default["strompreis"]), step=0.01,
+            format="%.3f", key="bw_strompreis",
+        )
+        bilanz_modus = st.selectbox(
+            "Bilanzierungsmodus",
+            ["korrekt", "excel"],
+            format_func=lambda x: (
+                "Physikalisch konsistent" if x == "korrekt"
+                else "Excel-Nachrechnung"
+            ),
+            key="bw_bilanz_modus",
+        )
+        range_modus = st.selectbox(
+            "Umgang mit Modellgrenzen",
+            ["extrapolieren", "streng"],
+            format_func=lambda x: (
+                "Außerhalb extrapolieren (mit Warnung)" if x == "extrapolieren"
+                else "Streng – außerhalb nicht berechnen"
+            ),
+            key="bw_range_modus",
+        )
 
 
-def vergleich(p):
-    """Rechnet alle vier Varianten mit denselben Eingaben."""
-    return {n: simuliere(mit_variante(p, n)) for n in VARIANTEN}
+# Parameterdictionary des Rechenkerns aufbauen
+p_basis = dict(p_default)
+p_basis.update(
+    {
+        "v_feed": float(v_feed),
+        "tds_feed": float(tds_feed),
+        "so4_feed": float(so4_feed),
+        "y_uo": float(y_uo),
+        "y_nf": float(y_nf),
+        "p_nf": float(p_nf),
+        "y_fcdi": float(y_fcdi),
+        "eta_pumpe": float(eta_pumpe),
+        "nf_modul": nf_modul,
+        "nf_energie_basis": nf_energie_basis,
+        "strompreis": float(strompreis),
+        "bilanz_modus": bilanz_modus,
+        "range_modus": range_modus,
+    }
+)
+
+p_einzel = sim.mit_variante(p_basis, variante)
 
 
-def parameterstudie(p, schluessel, werte, ausgaben=("ausbeute", "tds_produkt", "e_gesamt", "v_sole")):
-    zeilen = []
-    for w in werte:
-        q = copy.deepcopy(p); q[schluessel] = float(w)
-        try:
-            r = simuliere(q); k = r["kenn"]
-            zeilen.append({schluessel: float(w), "ausbeute": k["ausbeute"], "tds_produkt": k["tds_produkt"], "e_gesamt": k["e_spez"]["gesamt"],
-                           "v_sole": k["v_sole"], "tds_sole": k["tds_sole"], "v_produkt": k["v_produkt"], "warnungen": len(r["warnungen"])})
-        except ValueError:
-            zeilen.append({schluessel: float(w)})
-    return pd.DataFrame(zeilen)
+# ============================================================
+# 4. BERECHNUNG
+# ============================================================
+
+try:
+    with st.spinner("Simulation wird berechnet …"):
+        res = sim.simuliere(p_einzel)
+        vergleich = sim.vergleich(p_basis)
+except Exception as exc:
+    st.error(f"Die Simulation konnte nicht berechnet werden: {exc}")
+    st.exception(exc)
+    st.stop()
+
+kenn = res["kenn"]
+df = res["df"]
 
 
-# Referenzwerte aus der Excel-Datei (Zwischenspeicher der Solver-Ergebnisse)
-EXCEL_REFERENZ = {
-    "4a": dict(v2=12.9032, c2=834.7134, v3=7.0968, c3=7.0951, c4=1722.2222, c5=265.3928, c6=3179.0517, c8=6259.2837, v_diluat=1.4516, c_diluat=98.8197,
-               v_produkt=8.5484, c_produkt=22.6709, ausbeute=85.4839, e_gesamt=0.9431, e_uo=0.3885, e_nf=0.1034, e_fcdi=0.4512),
-    "UO+NF": dict(v2=12.9032, c2=834.7134, c3=7.0951, c4=1722.2222, c5=265.3928, c6=3179.0517, v_produkt=7.0968, ausbeute=70.9677),
-    "Bestand": dict(v2=12.1212, c2=886.9651, c3=12.4175, c4=2357.1429, c5=354.0863, c6=4360.1994, v_produkt=7.8788, ausbeute=78.7879),
-    "4b": dict(v3=5.5, c4=2211.8333, c_diluat=73.8884, c8=4349.7782, c_produkt=27.4837, ausbeute=77.5, e_gesamt=1.0607),
-}
+# ============================================================
+# 5. PROZESSFLIESSBILD
+# ============================================================
+
+st.subheader(f"Prozessfließbild – {variante}")
+
+if dar is not None and hasattr(dar, "build_svg"):
+    try:
+        svg = dar.build_svg(res)
+        components.html(svg, height=470, scrolling=True)
+    except Exception as exc:
+        st.warning(f"Das Prozessfließbild konnte nicht erzeugt werden: {exc}")
+else:
+    st.info(
+        "Für das dynamische Prozessfließbild bitte die Datei "
+        "`darstellung.py` mit der Funktion `build_svg(res)` neben `app.py` ablegen."
+    )
+
+
+# ============================================================
+# 6. ERGEBNIS-KENNZAHLEN
+# ============================================================
+
+st.subheader("Ergebnisübersicht")
+
+k1, k2, k3, k4 = st.columns(4)
+metric_safe(k1, "Produktwasser", fmt_de(kenn["v_produkt"], 2), "m³/h")
+metric_safe(k2, "Produktwasser-TDS", fmt_de(kenn["tds_produkt"], 1), "mg/L")
+metric_safe(k3, "Gesamtausbeute", fmt_de(kenn["ausbeute"], 1), "%")
+metric_safe(k4, "Gesamtrückhalt TDS", fmt_de(kenn["rueckhalt_gesamt"], 1), "%")
+
+k5, k6, k7, k8 = st.columns(4)
+metric_safe(k5, "Spezifischer Energiebedarf", fmt_de(kenn["e_spez"]["gesamt"], 3), "kWh/m³ Produkt")
+metric_safe(k6, "Elektrische Leistung", fmt_de(kenn["leistung_kw"], 2), "kW")
+metric_safe(k7, "Sole-Volumenstrom", fmt_de(kenn["v_sole"], 2), "m³/h")
+metric_safe(k8, "Energiekosten", fmt_de(kenn["energiekosten_ct_m3"], 2), "ct/m³ Produkt")
+
+if not kenn.get("gueltig", True):
+    st.error(
+        "Mindestens eine zentrale Ergebnisgröße ist nicht berechenbar. "
+        "Bitte Modellgrenzen und Warnungen prüfen."
+    )
+
+if res["warnungen"]:
+    with st.expander(f"Modell- und Gültigkeitsbereichswarnungen ({len(res['warnungen'])})", expanded=True):
+        for warnung in res["warnungen"]:
+            st.warning(warnung)
+else:
+    st.success("Keine Modell-Gültigkeitsbereichswarnungen für diese Berechnung.")
+
+
+# ============================================================
+# 7. REGISTERKARTEN
+# ============================================================
+
+tab_einzel, tab_vergleich, tab_studie = st.tabs(
+    ["Einzelkonzept", "Variantenvergleich", "Parameterstudie"]
+)
+
+
+with tab_einzel:
+    st.markdown("#### Stoffstrombilanz")
+
+    anzeige = df.copy()
+    for col in [
+        "Volumenstrom (m³/h)", "TDS (mg/L)", "Sulfat (mg/L)",
+        "TDS-Fracht (g/h)",
+    ]:
+        if col in anzeige.columns:
+            anzeige[col] = anzeige[col].map(
+                lambda x: fmt_de(x, 2) if pd.notna(x) else "–"
+            )
+
+    st.dataframe(anzeige, use_container_width=True, hide_index=True)
+
+    c_left, c_right = st.columns(2)
+
+    with c_left:
+        st.markdown("#### Volumenströme")
+        fig_v = px.bar(
+            df, x="Strom", y="Volumenstrom (m³/h)",
+            text="Volumenstrom (m³/h)",
+        )
+        fig_v.update_traces(texttemplate="%{text:.2f}", textposition="outside")
+        fig_v.update_layout(
+            template="plotly_white", height=390,
+            xaxis_title="", yaxis_title="Volumenstrom (m³/h)",
+            margin=dict(l=20, r=20, t=35, b=90),
+        )
+        st.plotly_chart(fig_v, use_container_width=True)
+
+    with c_right:
+        st.markdown("#### TDS-Konzentrationen")
+        df_tds = df[df["TDS (mg/L)"].notna()].copy()
+        fig_tds = px.bar(
+            df_tds, x="Strom", y="TDS (mg/L)",
+            text="TDS (mg/L)",
+        )
+        fig_tds.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
+        fig_tds.update_layout(
+            template="plotly_white", height=390,
+            xaxis_title="", yaxis_title="TDS (mg/L)",
+            margin=dict(l=20, r=20, t=35, b=90),
+        )
+        st.plotly_chart(fig_tds, use_container_width=True)
+
+    st.markdown("#### Energieaufteilung")
+    energie = pd.DataFrame(
+        {
+            "Verfahren": ["UO", "NF", "FCDI"],
+            "Leistung (kW)": [
+                kenn["p_uo_kw"], kenn["p_nf_kw"], kenn["p_fcdi_kw"]
+            ],
+        }
+    )
+    energie = energie.replace([np.inf, -np.inf], np.nan).dropna()
+    fig_e = px.bar(
+        energie, x="Verfahren", y="Leistung (kW)",
+        text="Leistung (kW)",
+    )
+    fig_e.update_traces(texttemplate="%{text:.3f}", textposition="outside")
+    fig_e.update_layout(
+        template="plotly_white", height=320,
+        yaxis_title="Leistung (kW)", xaxis_title="",
+    )
+    st.plotly_chart(fig_e, use_container_width=True)
+
+    st.markdown("#### Weitere Kennzahlen")
+    weitere = pd.DataFrame(
+        [
+            ("Produktwasser-Sulfat", kenn["so4_produkt"], "mg/L"),
+            ("Sole-TDS", kenn["tds_sole"], "mg/L"),
+            ("Sole-Sulfat", kenn["so4_sole"], "mg/L"),
+            ("Gesamtrückhalt Sulfat", kenn["rueckhalt_so4_gesamt"], "%"),
+            ("NF-Druckerhöhung", kenn["dp_nf_boost"], "bar"),
+            ("Iterationen NF-Rezirkulation", kenn["iterationen"], "–"),
+            ("Abweichung Wasserbilanz", kenn["wasserbilanz_abw"], "m³/h"),
+            ("Abweichung Salzbilanz", kenn["salzbilanz_abw"], "g/h"),
+        ],
+        columns=["Kennzahl", "Wert", "Einheit"],
+    )
+    weitere["Wert"] = weitere["Wert"].map(lambda x: fmt_de(x, 4))
+    st.dataframe(weitere, use_container_width=True, hide_index=True)
+
+    csv_bytes = df.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+    st.download_button(
+        "Stoffstromtabelle als CSV herunterladen",
+        data=csv_bytes,
+        file_name="brackwasser_stoffstroeme.csv",
+        mime="text/csv",
+    )
+
+
+with tab_vergleich:
+    st.markdown("#### Vergleich aller vier Anlagenvarianten")
+    st.caption(
+        "Alle Varianten werden mit denselben Rohwasser- und Betriebsparametern "
+        "berechnet. Die NF- und FCDI-Stufen werden je nach Variante aktiviert."
+    )
+
+    vergleich_zeilen = []
+    for name, ergebnis in vergleich.items():
+        k = ergebnis["kenn"]
+        vergleich_zeilen.append(
+            {
+                "Variante": name,
+                "Produktwasser (m³/h)": k["v_produkt"],
+                "TDS Produkt (mg/L)": k["tds_produkt"],
+                "Ausbeute (%)": k["ausbeute"],
+                "TDS-Rückhalt (%)": k["rueckhalt_gesamt"],
+                "Energie (kWh/m³)": k["e_spez"]["gesamt"],
+                "Leistung (kW)": k["leistung_kw"],
+                "Sole (m³/h)": k["v_sole"],
+                "Energiekosten (ct/m³)": k["energiekosten_ct_m3"],
+                "Gültig": "Ja" if k.get("gueltig", True) else "Nein",
+                "Warnungen": len(ergebnis["warnungen"]),
+            }
+        )
+
+    df_vgl = pd.DataFrame(vergleich_zeilen)
+    df_vgl_anzeige = df_vgl.copy()
+    for col in df_vgl_anzeige.columns:
+        if col not in ("Variante", "Gültig", "Warnungen"):
+            df_vgl_anzeige[col] = df_vgl_anzeige[col].map(
+                lambda x: fmt_de(x, 3)
+            )
+    st.dataframe(df_vgl_anzeige, use_container_width=True, hide_index=True)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(
+            df_vgl, x="Variante", y="TDS Produkt (mg/L)",
+            color="Variante", text="TDS Produkt (mg/L)",
+            title="TDS im Produktwasser",
+        )
+        fig.update_layout(template="plotly_white", showlegend=False, xaxis_title="")
+        fig.update_traces(texttemplate="%{text:,.1f}", textposition="outside")
+        st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        fig = px.bar(
+            df_vgl, x="Variante", y="Energie (kWh/m³)",
+            color="Variante", text="Energie (kWh/m³)",
+            title="Spezifischer Energiebedarf",
+        )
+        fig.update_layout(template="plotly_white", showlegend=False, xaxis_title="")
+        fig.update_traces(texttemplate="%{text:.3f}", textposition="outside")
+        st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("#### Modellwarnungen je Variante")
+    for name, ergebnis in vergleich.items():
+        if ergebnis["warnungen"]:
+            with st.expander(f"{name}: {len(ergebnis['warnungen'])} Warnung(en)"):
+                for w in ergebnis["warnungen"]:
+                    st.warning(w)
+        else:
+            st.caption(f"{name}: keine Warnungen")
+
+    vgl_csv = df_vgl.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+    st.download_button(
+        "Variantenvergleich als CSV herunterladen",
+        data=vgl_csv,
+        file_name="brackwasser_variantenvergleich.csv",
+        mime="text/csv",
+        key="download_vgl",
+    )
+
+
+with tab_studie:
+    st.markdown("#### Einfluss eines Parameters untersuchen")
+    st.caption(
+        "Die Parameterstudie variiert jeweils einen Parameter und berechnet "
+        "die gewählte Anlagenvariante erneut."
+    )
+
+    parameter_optionen = {
+        "UO-Ausbeute (%)": ("y_uo", 30.0, 90.0, 5.0),
+        "NF-Ausbeute (%)": ("y_nf", 20.0, 80.0, 5.0),
+        "NF-Zulaufdruck (bar)": ("p_nf", 5.0, 30.0, 2.5),
+        "FCDI-Ausbeute (%)": ("y_fcdi", 50.0, 90.0, 5.0),
+        "Rohwasser-TDS (mg/L)": ("tds_feed", 500.0, 15000.0, 500.0),
+        "Rohwasser-Volumenstrom (m³/h)": ("v_feed", 1.0, 100.0, 5.0),
+    }
+
+    auswahl = st.selectbox("Zu variierender Parameter", list(parameter_optionen.keys()))
+    key, minimum, maximum, schritt = parameter_optionen[auswahl]
+
+    aktueller_wert = float(p_einzel[key])
+    start_wert = st.number_input(
+        "Startwert", min_value=float(minimum), max_value=float(maximum),
+        value=float(max(minimum, min(maximum, aktueller_wert - 2 * schritt))),
+        step=float(schritt), key="bw_studie_start",
+    )
+    ende_wert = st.number_input(
+        "Endwert", min_value=float(minimum), max_value=float(maximum),
+        value=float(max(minimum, min(maximum, aktueller_wert + 2 * schritt))),
+        step=float(schritt), key="bw_studie_ende",
+    )
+    anzahl = st.slider("Anzahl Berechnungspunkte", 3, 25, 9, 1)
+
+    if start_wert >= ende_wert:
+        st.warning("Der Endwert muss größer als der Startwert sein.")
+    else:
+        werte = np.linspace(start_wert, ende_wert, anzahl)
+        studie = sim.parameterstudie(
+            p_einzel,
+            key,
+            werte,
+        )
+
+        if not studie.empty:
+            y_auswahl = st.selectbox(
+                "Darzustellende Ergebnisgröße",
+                [
+                    "ausbeute",
+                    "tds_produkt",
+                    "e_gesamt",
+                    "v_sole",
+                    "tds_sole",
+                    "v_produkt",
+                ],
+                format_func=lambda x: {
+                    "ausbeute": "Gesamtausbeute (%)",
+                    "tds_produkt": "Produktwasser-TDS (mg/L)",
+                    "e_gesamt": "Spezifische Energie (kWh/m³)",
+                    "v_sole": "Sole-Volumenstrom (m³/h)",
+                    "tds_sole": "Sole-TDS (mg/L)",
+                    "v_produkt": "Produktwasser-Volumenstrom (m³/h)",
+                }[x],
+            )
+            x_col = key
+            if y_auswahl in studie.columns:
+                plot_df = studie.dropna(subset=[y_auswahl]).copy()
+                if not plot_df.empty:
+                    fig = px.line(
+                        plot_df, x=x_col, y=y_auswahl,
+                        markers=True,
+                        title=f"{auswahl} – Einfluss auf {y_auswahl}",
+                    )
+                    fig.update_layout(
+                        template="plotly_white",
+                        xaxis_title=auswahl,
+                        yaxis_title=y_auswahl,
+                        height=420,
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.warning(
+                        "Für diese Parameterkombination konnten keine "
+                        "gültigen Werte berechnet werden."
+                    )
+
+            studie_anzeige = studie.copy()
+            for col in studie_anzeige.columns:
+                if col != key and col != "warnungen":
+                    studie_anzeige[col] = studie_anzeige[col].map(
+                        lambda x: fmt_de(x, 3) if pd.notna(x) else "–"
+                    )
+            st.dataframe(studie_anzeige, use_container_width=True, hide_index=True)
+
+            studie_csv = studie.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+            st.download_button(
+                "Parameterstudie als CSV herunterladen",
+                data=studie_csv,
+                file_name="brackwasser_parameterstudie.csv",
+                mime="text/csv",
+                key="download_studie",
+            )
+
+
+# ============================================================
+# 8. FOOTER
+# ============================================================
+
+st.divider()
+st.caption(
+    "Brackwasser-Aufbereitungssimulation | Ergebnisse basieren auf den im "
+    "Rechenkern hinterlegten Regressionsmodellen und Betriebsannahmen."
+)
